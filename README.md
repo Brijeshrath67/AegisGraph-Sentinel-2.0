@@ -286,9 +286,6 @@ docker run -p 8000:8000 aegisgraph-sentinel:2.0
 kubectl apply -f k8s/deployment.yaml
 ```
 
-## 🤝 Contributing
-
-This is a submission for the **2026 National Fraud Prevention Challenge** organized by IIT Delhi & RBI Innovation Hub.
 
 ## 📄 License
 
@@ -300,7 +297,7 @@ For inquiries regarding deployment or collaboration, please contact the developm
 
 ---
 
-**Submission for**: 2026 National Fraud Prevention Challenge  
+
 **Domain**: Financial Crime Prevention & AI/ML  
 **Date**: February 26, 2026
 
