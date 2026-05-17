@@ -6,6 +6,9 @@ Combines multiple fraud signals into a comprehensive risk score:
 2. Velocity-based risk
 3. Behavioral biometrics risk  
 4. Entropy-based risk
+
+Thresholds loaded from config/thresholds.yaml - see that file for all
+detection limits and sensitivity values.
 """
 # Updated: May 17, 2026
 
@@ -18,6 +21,7 @@ from ..models.risk_model import FraudDetectionModel
 from ..features.velocity_calculator import VelocityCalculator, Transaction
 from ..features.behavioral_biometrics import analyze_keystroke_data
 from ..features.entropy_calculator import compute_entropy_risk_score
+from ..utils.helpers import load_thresholds
 
 
 class RiskScorer:
@@ -52,11 +56,28 @@ class RiskScorer:
         self.w_behavior = weights.get('behavior', 0.20)
         self.w_entropy = weights.get('entropy', 0.10)
         
-        # Thresholds
-        thresholds = config.get('risk_scoring', {}).get('thresholds', {})
-        self.threshold_block = thresholds.get('block', 0.90)
-        self.threshold_review = thresholds.get('review', 0.70)
-        self.threshold_allow = thresholds.get('allow', 0.50)
+        # Thresholds - load from thresholds.yaml with fallback to config.yaml
+        try:
+            threshold_config = load_thresholds('config/thresholds.yaml', validate=True)
+            rs = threshold_config.get('risk_scoring', {})
+            self.threshold_block = rs.get('block', 0.90)
+            self.threshold_review = rs.get('review', 0.70)
+            self.threshold_allow = rs.get('allow', 0.50)
+            
+            # Graph analysis thresholds
+            ga = threshold_config.get('graph_analysis', {})
+            self.lateral_movement_std = ga.get('lateral_movement_std_multiplier', 2.0)
+            self.lateral_movement_mult = ga.get('lateral_movement_threshold_multiplier', 3.0)
+            self.lateral_movement_risk_increment = 0.25  # Hardcoded but documented
+        except Exception:
+            # Fallback to config.yaml
+            thresholds = config.get('risk_scoring', {}).get('thresholds', {})
+            self.threshold_block = thresholds.get('block', 0.90)
+            self.threshold_review = thresholds.get('review', 0.70)
+            self.threshold_allow = thresholds.get('allow', 0.50)
+            self.lateral_movement_std = 2.0
+            self.lateral_movement_mult = 3.0
+            self.lateral_movement_risk_increment = 0.25
         
         # Feature calculators
         self.velocity_calculator = VelocityCalculator()
@@ -412,13 +433,16 @@ def compute_risk_score(
                     baseline_avg = np.mean(baseline_history)
                     baseline_std = np.std(baseline_history) if len(baseline_history) > 1 else 0.001
                     
-                    # Spike detection: current > baseline + 2 standard deviations OR current > 3x baseline
-                    spike_threshold = max(baseline_avg + 2 * baseline_std, baseline_avg * 3)
+                    # Spike detection: configurable thresholds (from thresholds.yaml)
+                    spike_threshold = max(
+                        baseline_avg + self.lateral_movement_std * baseline_std,
+                        baseline_avg * self.lateral_movement_mult
+                    )
                     
                     if current_score > spike_threshold and baseline_avg > 0:
                         lateral_movement_detected = True
                         lateral_movement_reason = f"Lateral movement detected: {source_account} betweenness centrality spiked from baseline {baseline_avg:.4f} to {current_score:.4f} (MITRE ATT&CK TA0008)"
-                        graph_risk += 0.25
+                        graph_risk += self.lateral_movement_risk_increment
                         print(f"🚨 LATERAL MOVEMENT: {source_account} pivoting through network - centrality spike from {baseline_avg:.4f} to {current_score:.4f}")
                 
                 # Update baseline (rolling window)

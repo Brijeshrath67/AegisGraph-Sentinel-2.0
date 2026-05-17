@@ -14,13 +14,23 @@ Features extracted:
 - Typing speed (WPM)
 - Error rate (backspace frequency)
 - Rhythm consistency
+
+Thresholds loaded from config/thresholds.yaml - see that file for all
+detection limits and sensitivity values.
 """
+# Working on keystroke dynamics for stress detection
 
 import numpy as np
 import torch
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from scipy.stats import variation
+
+try:
+    from ..utils.helpers import load_thresholds
+    THRESHOLDS_AVAILABLE = True
+except ImportError:
+    THRESHOLDS_AVAILABLE = False
 
 
 @dataclass
@@ -59,11 +69,24 @@ class KeystrokeDynamicsAnalyzer:
         self,
         baseline_wpm: float = 40.0,
         baseline_hold_time: float = 120.0,
-        stress_threshold: float = 0.70,
+        stress_threshold: float = None,
     ):
+        # Load thresholds from config with fallback to defaults
+        if THRESHOLDS_AVAILABLE:
+            try:
+                threshold_config = load_thresholds('config/thresholds.yaml', validate=True)
+                bb = threshold_config.get('behavioral_biometrics', {})
+                self.stress_threshold = bb.get('stress_threshold', 0.70)
+                self.max_depth = bb.get('max_depth', 5)  # For graph traversal
+            except Exception:
+                self.stress_threshold = stress_threshold if stress_threshold is not None else 0.70
+                self.max_depth = 5
+        else:
+            self.stress_threshold = stress_threshold if stress_threshold is not None else 0.70
+            self.max_depth = 5
+        
         self.baseline_wpm = baseline_wpm
         self.baseline_hold_time = baseline_hold_time
-        self.stress_threshold = stress_threshold
     
     def extract_features(
         self,
