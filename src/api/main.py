@@ -824,8 +824,7 @@ async def check_transaction(request: TransactionCheckRequest):
         state.total_processing_time += processing_time_ms
         
         # Prepare response with innovation fields
-        decision_map = {'ALLOW': 'approve', 'REVIEW': 'review', 'BLOCK': 'block'}
-        decision = decision_map.get(risk_result['decision'], risk_result['decision'].lower())
+        decision = risk_result['decision']
         response = TransactionCheckResponse(
             transaction_id=request.transaction_id,
             risk_score=risk_result['risk_score'],
