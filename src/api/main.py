@@ -1384,13 +1384,14 @@ def analyze_voice(request: VoiceAnalysisRequest):
     
     start_time = time.time()
     
+    tmp_path = None
     try:
         import base64
         import tempfile
         import wave
         
         # Decode base64 audio
-        audio_bytes = base64.b64decode(request.audio_base64)
+        audio_bytes = base64.b64decode(request.audio_base64, validate=True)
         
         # Save to temporary file
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.wav', delete=False) as tmp:
@@ -1403,9 +1404,6 @@ def analyze_voice(request: VoiceAnalysisRequest):
             sample_rate=request.sample_rate
         )
         
-        # Clean up temp file
-        Path(tmp_path).unlink()
-        
         processing_time_ms = (time.time() - start_time) * 1000
         
         return VoiceAnalysisResponse(
@@ -1417,10 +1415,13 @@ def analyze_voice(request: VoiceAnalysisRequest):
             recommended_action=result['recommended_action'],
             processing_time_ms=processing_time_ms,
         )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Voice analysis failed: {str(e)}")
-
+    finally:
+        # This guarantees the file is deleted even if the analysis crashes
+        if tmp_path:
+            from pathlib import Path
+            Path(tmp_path).unlink(missing_ok=True)
 
 @app.post(
     "/api/v1/accounts/score-opening",
