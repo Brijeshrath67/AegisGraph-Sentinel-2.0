@@ -947,7 +947,7 @@ elif page == "📊 Risk Analytics":
             
         fig_bar = px.bar(
             x=values, 
-            y=['Anomaly Contribution'], 
+            y=['Anomaly Contribution'] * len(values), 
             orientation='h', 
             color=categories,
             color_discrete_sequence=['#ff4d4d', '#ffaa00', '#00ccff', '#cc33ff'],
