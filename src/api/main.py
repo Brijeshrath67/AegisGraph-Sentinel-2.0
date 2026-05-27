@@ -37,6 +37,7 @@ import json
 import networkx as nx
 import numpy as np
 from enum import Enum
+from itertools import islice
 
 from ..config import get_settings
 from ..config.validation import validate_environment
@@ -104,6 +105,15 @@ def _normalize_decision(decision: object) -> str:
 
 def _decision_to_api_value(decision: object) -> str:
     return _API_DECISION_MAP[_normalize_decision(decision)]
+
+
+def _chunked(items, chunk_size):
+    iterator = iter(items)
+    while True:
+        chunk = list(islice(iterator, chunk_size))
+        if not chunk:
+            break
+        yield chunk
 
 
 def _require_honeypot_admin(x_honeypot_token: Optional[str]) -> None:
@@ -1499,20 +1509,22 @@ async def check_batch_transactions(request: BatchTransactionRequest):
     results = []
     stats = {decision.value: 0 for decision in FraudDecision}
 
-    semaphore = asyncio.Semaphore(8)
-    # Lock the iterator into memory so we can read it twice
+    max_concurrent_tasks = 8
+    semaphore = asyncio.Semaphore(max_concurrent_tasks)
     txns = list(request.transactions)
 
     async def _process_transaction(txn_request):
         async with semaphore:
             return await check_transaction(txn_request)
 
-    batch_results = await asyncio.gather(
-        *(_process_transaction(txn_request) for txn_request in txns),
-        return_exceptions=True,
-    )
+    batch_results = []
+    for txn_chunk in _chunked(txns, max_concurrent_tasks):
+        chunk_results = await asyncio.gather(
+            *(_process_transaction(txn_request) for txn_request in txn_chunk),
+            return_exceptions=True,
+        )
+        batch_results.extend(chunk_results)
 
-    # Iterate over our locked list, not the raw request stream
     for txn_request, result in zip(txns, batch_results):
         if isinstance(result, Exception):
             _api_logger.error(
