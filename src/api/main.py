@@ -18,12 +18,13 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from itertools import islice
+from typing import Any, Dict, List, Optional
 
 import networkx as nx
 import numpy as np
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -100,6 +101,7 @@ from .schemas import (
     VoiceAnalysisResponse,
     HoneypotStatus,
 )
+from .security import require_api_key
 
 def _require_legal_export_authorization(authorization_token: Optional[str]) -> None:
     """Legacy wrapper: ensure a provided authorization token matches configured hash.
@@ -183,6 +185,7 @@ def _validate_legal_export_request(
         raise HTTPException(status_code=403, detail="Unauthorized legal export request")
 from ..exceptions import register_exception_handlers, register_observability_middleware
 from ..observability import get_audit_logger, get_logger
+from ..core import register_core_services, register_graph_services, register_innovation_services
 
 _api_logger = get_logger("api")
 _audit_logger = get_audit_logger()
@@ -218,6 +221,22 @@ def _normalize_decision(decision: object) -> str:
 
 def _decision_to_api_value(decision: object) -> str:
     return _API_DECISION_MAP[_normalize_decision(decision)]
+
+
+def _chunked(items, chunk_size):
+    iterator = iter(items)
+    while True:
+        chunk = list(islice(iterator, chunk_size))
+        if not chunk:
+            break
+        yield chunk
+def _raise_internal_server_error(operation: str, exc: Exception) -> None:
+    _api_logger.error(
+        f"{operation} failed: {exc}",
+        event_type="api_internal_error",
+        metadata={"operation": operation, "error_type": type(exc).__name__},
+    )
+    raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 def _require_honeypot_admin(x_honeypot_token: Optional[str]) -> None:
@@ -409,6 +428,17 @@ except (ImportError, SyntaxError) as e:
         event_type="innovation_import_fallback",
     )
     INNOVATIONS_AVAILABLE = False
+
+LATERAL_MOVEMENT_AVAILABLE = False
+try:
+    from ..features.lateral_movement import LateralMovementDetector
+    LATERAL_MOVEMENT_AVAILABLE = True
+except (ImportError, SyntaxError) as e:
+    _api_logger.warning(
+        f"Lateral movement module unavailable ({e})",
+        event_type="innovation_import_fallback",
+    )
+    LATERAL_MOVEMENT_AVAILABLE = False
        
     # Demo mode functions
     def compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs) -> dict:
@@ -738,7 +768,13 @@ except (ImportError, SyntaxError) as e:
 class AppState:
     """Application state"""
     def __init__(self):
-        self.lateral_movement_detector = None
+        # Initialize runtime container first
+        self.runtime = RuntimeState()
+        self.runtime.bind_legacy_state(self)
+        self.services = self.runtime.services
+        self.tasks = self.runtime.tasks
+        self.settings = settings
+
         self.start_time = time.time()
         self.requests_processed = 0
         self.decisions = {decision.value: 0 for decision in FraudDecision}
@@ -755,24 +791,68 @@ class AppState:
         # Lateral movement detection - rolling betweenness centrality baseline
         self.centrality_baseline = {}  # {account_id: [centrality_history]}
         self.centrality_window_size = 10  # Track last 10 measurements
-        # Innovation managers
+        # Innovation managers (dynamically registered in services container via properties)
         self.voice_analyzer = None
         self.mule_scorer = None
         self.honeypot_manager = None
         self.blockchain_manager = None
         self.aegis_oracle = None  # Explainability engine
-        self.runtime = RuntimeState()
-        self.runtime.bind_legacy_state(self)
-        self.services = self.runtime.services
-        self.tasks = self.runtime.tasks
-        self.settings = settings
+        self.lateral_movement_detector = None
+
+    @property
+    def voice_analyzer(self) -> Any:
+        return self.services.optional_get("voice_analyzer")
+
+    @voice_analyzer.setter
+    def voice_analyzer(self, value: Any) -> None:
+        self.services.register("voice_analyzer", value, replace=True)
+
+    @property
+    def mule_scorer(self) -> Any:
+        return self.services.optional_get("mule_scorer")
+
+    @mule_scorer.setter
+    def mule_scorer(self, value: Any) -> None:
+        self.services.register("mule_scorer", value, replace=True)
+
+    @property
+    def honeypot_manager(self) -> Any:
+        return self.services.optional_get("honeypot_manager")
+
+    @honeypot_manager.setter
+    def honeypot_manager(self, value: Any) -> None:
+        self.services.register("honeypot_manager", value, replace=True)
+
+    @property
+    def blockchain_manager(self) -> Any:
+        return self.services.optional_get("blockchain_manager")
+
+    @blockchain_manager.setter
+    def blockchain_manager(self, value: Any) -> None:
+        self.services.register("blockchain_manager", value, replace=True)
+
+    @property
+    def aegis_oracle(self) -> Any:
+        return self.services.optional_get("aegis_oracle")
+
+    @aegis_oracle.setter
+    def aegis_oracle(self, value: Any) -> None:
+        self.services.register("aegis_oracle", value, replace=True)
+
+    @property
+    def lateral_movement_detector(self) -> Any:
+        return self.services.optional_get("lateral_movement_detector")
+
+    @lateral_movement_detector.setter
+    def lateral_movement_detector(self, value: Any) -> None:
+        self.services.register("lateral_movement_detector", value, replace=True)
         
 state = AppState()
 
 
 async def _honeypot_auto_release_loop(interval_seconds: int = 60):
     await honeypot_auto_release_loop(
-        lambda: state.honeypot_manager,
+        lambda: state.services.optional_get("honeypot_manager"),
         interval_seconds=interval_seconds,
         logger=_api_logger,
     )
@@ -791,8 +871,7 @@ def _validate_runtime_environment(startup_logger):
 def _load_runtime_configuration(startup_logger):
     state.settings = get_settings(refresh=True)
     state.config = state.settings.raw_config
-    state.services.register_service("settings", state.settings, replace=True)
-    state.services.register_service("config", state.config, replace=True)
+    register_core_services(state.services, state.settings, state.config)
     if state.settings.runtime.config_path.exists():
         startup_logger.info(
             "Configuration loaded",
@@ -805,9 +884,19 @@ def _load_runtime_configuration(startup_logger):
             event_type="config_missing",
             metadata={"path": str(state.settings.runtime.config_path)},
         )
-    
 
-def _load_graph_runtime_data(startup_logger):
+
+def _read_file_bytes(path: Path) -> bytes:
+    with open(path, "rb") as file_handle:
+        return file_handle.read()
+
+
+def _read_json_file(path: Path):
+    with open(path, "r") as file_handle:
+        return json.load(file_handle)
+
+
+async def _load_graph_runtime_data(startup_logger):
     try:
         # === SECURE GRAPH LOADING ===
         runtime_settings = state.settings
@@ -822,9 +911,8 @@ def _load_graph_runtime_data(startup_logger):
         EXPECTED_GRAPH_SHA256 = runtime_settings.graph.graph_sha256
         
         if graph_path:
-            with open(graph_path, "rb") as f:
-                file_bytes = f.read()
-                actual_hash = hashlib.sha256(file_bytes).hexdigest()
+            file_bytes = await asyncio.to_thread(_read_file_bytes, graph_path)
+            actual_hash = hashlib.sha256(file_bytes).hexdigest()
             
             if not EXPECTED_GRAPH_SHA256:
                 raise RuntimeError(
@@ -869,8 +957,7 @@ def _load_graph_runtime_data(startup_logger):
         # Load fraud chains
         chains_path = Path("data/synthetic/fraud_chains.json")
         if chains_path.exists():
-            with open(chains_path, 'r') as f:
-                state.fraud_chains = json.load(f)
+            state.fraud_chains = await asyncio.to_thread(_read_json_file, chains_path)
             for chain in state.fraud_chains:
                 state.mule_accounts.update(chain.get('accounts', []))
             startup_logger.info(
@@ -887,9 +974,8 @@ def _load_graph_runtime_data(startup_logger):
         # Load account profiles
         accounts_path = Path("data/synthetic/accounts.json")
         if accounts_path.exists():
-            with open(accounts_path, 'r') as f:
-                accounts_list = json.load(f)
-                state.account_profiles = {acc['account_id']: acc for acc in accounts_list}
+            accounts_list = await asyncio.to_thread(_read_json_file, accounts_path)
+            state.account_profiles = {acc['account_id']: acc for acc in accounts_list}
             startup_logger.info(
                 "Loaded account profiles",
                 event_type="accounts_loaded",
@@ -904,9 +990,12 @@ def _load_graph_runtime_data(startup_logger):
             event_type="graph_load_error",
         )
         state.graph_loaded = False
-    state.services.register_service("transaction_graph", state.transaction_graph, replace=True)
-    state.services.register_service("fraud_chains", state.fraud_chains, replace=True)
-    state.services.register_service("account_profiles", state.account_profiles, replace=True)
+    register_graph_services(
+        state.services,
+        state.transaction_graph,
+        state.fraud_chains,
+        state.account_profiles,
+    )
 
 
 def _initialize_model_runtime(startup_logger):
@@ -923,10 +1012,16 @@ def _initialize_model_runtime(startup_logger):
     
 
 def _initialize_innovation_runtime(startup_logger):
+    voice_analyzer = None
+    mule_scorer = None
+    honeypot_manager = None
+    blockchain_manager = None
+    aegis_oracle = None
+    lateral_movement_detector = None
+
     if INNOVATIONS_AVAILABLE:
         try:
-            state.voice_analyzer = VoiceStressAnalyzer()
-            state.services.register_service("voice_analyzer", state.voice_analyzer, replace=True)
+            voice_analyzer = VoiceStressAnalyzer()
             startup_logger.info("Voice Stress Analyzer initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -935,8 +1030,7 @@ def _initialize_innovation_runtime(startup_logger):
             )
 
         try:
-            state.mule_scorer = PredictiveMuleScorer()
-            state.services.register_service("mule_scorer", state.mule_scorer, replace=True)
+            mule_scorer = PredictiveMuleScorer()
             startup_logger.info("Predictive Mule Scorer initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -945,8 +1039,7 @@ def _initialize_innovation_runtime(startup_logger):
             )
 
         try:
-            state.honeypot_manager = HoneypotEscrowManager()
-            state.services.register_service("honeypot_manager", state.honeypot_manager, replace=True)
+            honeypot_manager = HoneypotEscrowManager()
             startup_logger.info("Honeypot Escrow Manager initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -955,8 +1048,7 @@ def _initialize_innovation_runtime(startup_logger):
             )
 
         try:
-            state.blockchain_manager = BlockchainEvidenceManager()
-            state.services.register_service("blockchain_manager", state.blockchain_manager, replace=True)
+            blockchain_manager = BlockchainEvidenceManager()
             startup_logger.info("Blockchain Evidence Manager initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -965,8 +1057,7 @@ def _initialize_innovation_runtime(startup_logger):
             )
 
         try:
-            state.aegis_oracle = AegisOracleExplainer()
-            state.services.register_service("aegis_oracle", state.aegis_oracle, replace=True)
+            aegis_oracle = AegisOracleExplainer()
             startup_logger.info("Aegis-Oracle Explainer initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -978,6 +1069,7 @@ def _initialize_innovation_runtime(startup_logger):
         try:
             state.lateral_movement_detector = LateralMovementDetector()
             state.services.register_service("lateral_movement_detector", state.lateral_movement_detector, replace=True)
+            lateral_movement_detector = state.lateral_movement_detector
             startup_logger.info("Lateral Movement Detector initialized", event_type="innovation_ready")
         except Exception as e:
             startup_logger.warning(
@@ -986,6 +1078,16 @@ def _initialize_innovation_runtime(startup_logger):
             )
     else:
         startup_logger.warning("Innovation modules not available", event_type="innovations_unavailable")
+
+    register_innovation_services(
+        state.services,
+        voice_analyzer=voice_analyzer,
+        mule_scorer=mule_scorer,
+        honeypot_manager=honeypot_manager,
+        blockchain_manager=blockchain_manager,
+        aegis_oracle=aegis_oracle,
+        lateral_movement_detector=lateral_movement_detector,
+    )
 
 
 def _startup_ready(startup_logger):
@@ -1289,7 +1391,8 @@ async def get_stats():
     response_model=TransactionCheckResponse,
     tags=["Fraud Detection"],
     summary="Check transaction for fraud",
-    description="Analyze a single transaction for fraud risk using HTGNN and behavioral biometrics"
+    description="Analyze a single transaction for fraud risk using HTGNN and behavioral biometrics",
+    dependencies=[Depends(require_api_key)]
 )
 async def check_transaction(request: TransactionCheckRequest):
     """
@@ -1346,6 +1449,11 @@ async def check_transaction(request: TransactionCheckRequest):
                         event_type="keystroke_analysis_error",
                     )
         
+        # Resolve services from container
+        lateral_movement_detector = state.services.optional_get("lateral_movement_detector")
+        honeypot_manager = state.services.optional_get("honeypot_manager")
+        blockchain_manager = state.services.optional_get("blockchain_manager")
+
         # Offload CPU-bound scoring + graph analysis to thread pool
         loop = asyncio.get_running_loop()
         risk_result = await loop.run_in_executor(
@@ -1372,7 +1480,7 @@ async def check_transaction(request: TransactionCheckRequest):
         honeypot_activated = False
         honeypot_id = None
         
-        if INNOVATIONS_AVAILABLE and state.honeypot_manager is not None:
+        if INNOVATIONS_AVAILABLE and honeypot_manager is not None:
             try:
                 # Extract fraud indicators from explanation
                 fraud_indicators = []
@@ -1383,7 +1491,7 @@ async def check_transaction(request: TransactionCheckRequest):
                 if risk_result['breakdown']['velocity'] > 0.8:
                     fraud_indicators.append('extreme_velocity')
                 
-                should_activate = state.honeypot_manager.should_activate_honeypot(
+                should_activate = honeypot_manager.should_activate_honeypot(
                     risk_score=risk_result['risk_score'],
                     decision=risk_result['decision'],
                     fraud_indicators=fraud_indicators,
@@ -1396,7 +1504,7 @@ async def check_transaction(request: TransactionCheckRequest):
                         None,
                         partial(
                             _activate_honeypot_sync,
-                            state.honeypot_manager,
+                            honeypot_manager,
                             request.transaction_id,
                             request.source_account,
                             request.target_account,
@@ -1431,7 +1539,7 @@ async def check_transaction(request: TransactionCheckRequest):
         # Innovation 6: Seal evidence in blockchain for high-risk transactions
         blockchain_evidence_id = None
         
-        if INNOVATIONS_AVAILABLE and state.blockchain_manager is not None:
+        if INNOVATIONS_AVAILABLE and blockchain_manager is not None:
             try:
                 logic_decision = _normalize_decision(risk_result['decision'])
                 if logic_decision in [FraudDecision.BLOCK.value, FraudDecision.REVIEW.value] or honeypot_activated:
@@ -1450,7 +1558,7 @@ async def check_transaction(request: TransactionCheckRequest):
                         None,
                         partial(
                             _seal_blockchain_sync,
-                            state.blockchain_manager,
+                            blockchain_manager,
                             request.transaction_id,
                             request.source_account,
                             request.target_account,
@@ -1533,15 +1641,18 @@ async def check_transaction(request: TransactionCheckRequest):
 
         return response
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid fraud analysis request") from exc
+    except Exception as exc:
+        _raise_internal_server_error("Fraud analysis", exc)
 
 
 @app.post(
     "/api/v1/explain",
     tags=["Explainability - Aegis-Oracle"],
     summary="Generate AI-explainable decision explanation",
-    description="Innovation 5: Aegis-Oracle generates regulatory-compliant explanations for all fraud decisions. Includes causal factors, evidence,  and legal admissibility."
+    description="Innovation 5: Aegis-Oracle generates regulatory-compliant explanations for all fraud decisions. Includes causal factors, evidence,  and legal admissibility.",
+    dependencies=[Depends(require_api_key)]
 )
 async def explain_transaction(request: ExplainRequest):
     """
@@ -1560,7 +1671,8 @@ async def explain_transaction(request: ExplainRequest):
     - Legal proceedings
     - RBI master direction compliance
     """
-    if not INNOVATIONS_AVAILABLE or state.aegis_oracle is None:
+    aegis_oracle = state.services.optional_get("aegis_oracle")
+    if not INNOVATIONS_AVAILABLE or aegis_oracle is None:
         raise HTTPException(status_code=503, detail="Aegis-Oracle Explainer not available")
     
     try:
@@ -1591,7 +1703,7 @@ async def explain_transaction(request: ExplainRequest):
         innovations_triggered = request.innovations_triggered
         
         # Use Aegis-Oracle to generate explanation
-        explanation = state.aegis_oracle.generate_explanation(
+        explanation = aegis_oracle.generate_explanation(
             transaction=transaction,
             risk_assessment=risk_assessment,
             break_down=breakdown,
@@ -1600,12 +1712,10 @@ async def explain_transaction(request: ExplainRequest):
         
         return explanation
         
-    except Exception as e:
-        _api_logger.error(
-            f"Explanation error: {e}",
-            event_type="explain_error",
-        )
-        raise HTTPException(status_code=500, detail=f"Explain error: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid explainability request") from exc
+    except Exception as exc:
+        _raise_internal_server_error("Explainability", exc)
 
 
 # Enhanced Aegis-Oracle endpoint
@@ -1613,7 +1723,8 @@ async def explain_transaction(request: ExplainRequest):
     "/api/v1/oracle/explain",
     tags=["Explainability - Aegis-Oracle"],
     summary="Get comprehensive AI reasoning for fraud decisions",
-    description="Advanced Aegis-Oracle endpoint with full forensic analysis and causal reasoning"
+    description="Advanced Aegis-Oracle endpoint with full forensic analysis and causal reasoning",
+    dependencies=[Depends(require_api_key)]
 )
 async def oracle_explain_detailed(request: OracleExplainRequest):
     """
@@ -1627,11 +1738,12 @@ async def oracle_explain_detailed(request: OracleExplainRequest):
     - Recommended investigative actions
     - Evidence trail for legal proceedings
     """
-    if not INNOVATIONS_AVAILABLE or state.aegis_oracle is None:
+    aegis_oracle = state.services.optional_get("aegis_oracle")
+    if not INNOVATIONS_AVAILABLE or aegis_oracle is None:
         raise HTTPException(status_code=503, detail="Oracle not available")
     
     try:
-        explanation = state.aegis_oracle.generate_explanation(
+        explanation = aegis_oracle.generate_explanation(
             transaction=request.transaction,
             risk_assessment=request.risk_assessment,
             attention_weights=request.attention_weights,
@@ -1646,8 +1758,10 @@ async def oracle_explain_detailed(request: OracleExplainRequest):
             'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={'error': str(e)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid oracle explainability request") from exc
+    except Exception as exc:
+        _raise_internal_server_error("Oracle explainability", exc)
 
 # DEBUG only: manually activate a honeypot via API.
 # This endpoint is ONLY registered when DEBUG env var is set to "true".
@@ -1660,10 +1774,11 @@ if settings.runtime.debug:
         description="Available only when DEBUG env var is 'true'. For testing only.",
     )
     def debug_activate_honeypot(request: HoneypotDebugRequest):
-        if state.honeypot_manager is None:
+        honeypot_manager = state.services.optional_get("honeypot_manager")
+        if honeypot_manager is None:
             raise HTTPException(status_code=500, detail="Honeypot manager not initialized")
         try:
-            hp = state.honeypot_manager.activate_honeypot(
+            hp = honeypot_manager.activate_honeypot(
                 transaction_id=request.transaction_id,
                 source_account=request.source_account,
                 target_account=request.target_account,
@@ -1674,13 +1789,14 @@ if settings.runtime.debug:
             )
             return {'honeypot_id': hp.honeypot_id, 'status': hp.status.value}
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            _raise_internal_server_error("Debug honeypot activation", e)
 @app.post(
     "/api/v1/fraud/batch",
     response_model=BatchTransactionResponse,
     tags=["Fraud Detection"],
     summary="Check multiple transactions",
-    description="Batch processing of multiple transactions for fraud detection"
+    description="Batch processing of multiple transactions for fraud detection",
+    dependencies=[Depends(require_api_key)]
 )
 async def check_batch_transactions(request: BatchTransactionRequest):
     """
@@ -1694,20 +1810,22 @@ async def check_batch_transactions(request: BatchTransactionRequest):
     results = []
     stats = {decision.value: 0 for decision in FraudDecision}
 
-    semaphore = asyncio.Semaphore(8)
-    # Lock the iterator into memory so we can read it twice
+    max_concurrent_tasks = 8
+    semaphore = asyncio.Semaphore(max_concurrent_tasks)
     txns = list(request.transactions)
 
     async def _process_transaction(txn_request):
         async with semaphore:
             return await check_transaction(txn_request)
 
-    batch_results = await asyncio.gather(
-        *(_process_transaction(txn_request) for txn_request in txns),
-        return_exceptions=True,
-    )
+    batch_results = []
+    for txn_chunk in _chunked(txns, max_concurrent_tasks):
+        chunk_results = await asyncio.gather(
+            *(_process_transaction(txn_request) for txn_request in txn_chunk),
+            return_exceptions=True,
+        )
+        batch_results.extend(chunk_results)
 
-    # Iterate over our locked list, not the raw request stream
     for txn_request, result in zip(txns, batch_results):
         if isinstance(result, Exception):
             _api_logger.error(
@@ -1740,7 +1858,7 @@ async def check_batch_transactions(request: BatchTransactionRequest):
     )
 
 
-@app.get("/api/v1/model/info", tags=["Model"])
+@app.get("/api/v1/model/info", tags=["Model"], dependencies=[Depends(require_api_key)])
 async def get_model_info():
     """
     Get information about the loaded model
@@ -1777,7 +1895,8 @@ async def get_model_info():
     response_model=VoiceAnalysisResponse,
     tags=["Innovation - Voice Stress"],
     summary="Analyze voice stress during transaction",
-    description="Innovation 5: Detects phone coercion through acoustic stress analysis"
+    description="Innovation 5: Detects phone coercion through acoustic stress analysis",
+    dependencies=[Depends(require_api_key)]
 )
 def analyze_voice(request: VoiceAnalysisRequest):
     """
@@ -1786,7 +1905,8 @@ def analyze_voice(request: VoiceAnalysisRequest):
     Uses acoustic features (F0, jitter, shimmer, speech rate, prosody) to classify
     stress levels: NORMAL, MILD_STRESS, or SEVERE_COERCION
     """
-    if not INNOVATIONS_AVAILABLE or state.voice_analyzer is None:
+    voice_analyzer = state.services.optional_get("voice_analyzer")
+    if not INNOVATIONS_AVAILABLE or voice_analyzer is None:
         raise HTTPException(status_code=503, detail="Voice analysis not available")
     
     start_time = time.time()
@@ -1806,7 +1926,7 @@ def analyze_voice(request: VoiceAnalysisRequest):
             tmp_path = tmp.name
         
         # Analyze voice stress
-        result = state.voice_analyzer.analyze_voice(
+        result = voice_analyzer.analyze_voice(
             audio_file=tmp_path,
             sample_rate=request.sample_rate
         )
@@ -1822,8 +1942,10 @@ def analyze_voice(request: VoiceAnalysisRequest):
             recommended_action=result['recommended_action'],
             processing_time_ms=processing_time_ms,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Voice analysis failed: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid voice analysis request") from exc
+    except Exception as exc:
+        _raise_internal_server_error("Voice analysis", exc)
     finally:
         # This guarantees the file is deleted even if the analysis crashes
         if tmp_path:
@@ -1835,7 +1957,8 @@ def analyze_voice(request: VoiceAnalysisRequest):
     response_model=AccountOpeningResponse,
     tags=["Innovation - Predictive Mule"],
     summary="Score account opening for mule risk",
-    description="Innovation 4: Predicts mule accounts before first transaction using 12 features"
+    description="Innovation 4: Predicts mule accounts before first transaction using 12 features",
+    dependencies=[Depends(require_api_key)]
 )
 def score_account_opening(request: AccountOpeningRequest):
     """
@@ -1844,14 +1967,15 @@ def score_account_opening(request: AccountOpeningRequest):
     Analyzes 12 features including temporal clustering, device novelty,
     geographic mismatch, and more to identify potential mule accounts
     """
-    if not INNOVATIONS_AVAILABLE or state.mule_scorer is None:
+    mule_scorer = state.services.optional_get("mule_scorer")
+    if not INNOVATIONS_AVAILABLE or mule_scorer is None:
         raise HTTPException(status_code=503, detail="Predictive mule scoring not available")
     
     start_time = time.time()
     
     try:
         # Score the account opening
-        result = state.mule_scorer.score_account_opening(
+        result = mule_scorer.score_account_opening(
             account_id=request.account_id,
             name=request.name,
             age=request.age,
@@ -1886,8 +2010,10 @@ def score_account_opening(request: AccountOpeningRequest):
             processing_time_ms=processing_time_ms,
         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Account scoring failed: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid account scoring request") from exc
+    except Exception as exc:
+        _raise_internal_server_error("Account scoring", exc)
 
 
 # Alias endpoint for mule assessment
@@ -1896,7 +2022,8 @@ def score_account_opening(request: AccountOpeningRequest):
     response_model=AccountOpeningResponse,
     tags=["Innovation - Predictive Mule"],
     summary="Assess account mule risk",
-    description="Innovation 3: Alias for mule assessment endpoint"
+    description="Innovation 3: Alias for mule assessment endpoint",
+    dependencies=[Depends(require_api_key)]
 )
 def assess_mule_risk(request: AccountOpeningRequest):
     """Alias endpoint for mule assessment"""
@@ -1919,13 +2046,14 @@ async def list_active_honeypots(
     Shows honeypots that are currently monitoring for withdrawal attempts
     and tracking fraud networks
     """
-    if not INNOVATIONS_AVAILABLE or state.honeypot_manager is None:
+    honeypot_manager = state.services.optional_get("honeypot_manager")
+    if not INNOVATIONS_AVAILABLE or honeypot_manager is None:
         raise HTTPException(status_code=503, detail="Honeypot system not available")
     _require_honeypot_admin(x_honeypot_token)
     
     try:
-        active = state.honeypot_manager.get_active_honeypots()
-        stats = state.honeypot_manager.get_statistics()
+        active = honeypot_manager.get_active_honeypots()
+        stats = honeypot_manager.get_statistics()
         
         honeypot_statuses = []
         for hp in active:
@@ -1951,8 +2079,8 @@ async def list_active_honeypots(
             total_recovered_today=stats.get('recovered_today', 0.0),
         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get honeypot list: {str(e)}")
+    except Exception as exc:
+        _raise_internal_server_error("Honeypot list retrieval", exc)
 
 
 @app.get(
@@ -1970,12 +2098,13 @@ async def get_honeypot_stats(
     
     Returns all-time metrics including arrests, recovery amounts, and false positive rates
     """
-    if not INNOVATIONS_AVAILABLE or state.honeypot_manager is None:
+    honeypot_manager = state.services.optional_get("honeypot_manager")
+    if not INNOVATIONS_AVAILABLE or honeypot_manager is None:
         raise HTTPException(status_code=503, detail="Honeypot system not available")
     _require_honeypot_admin(x_honeypot_token)
     
     try:
-        stats = state.honeypot_manager.get_statistics()
+        stats = honeypot_manager.get_statistics()
         
         return HoneypotStatsResponse(
             total_activated=stats['total_activated'],
@@ -1988,8 +2117,8 @@ async def get_honeypot_stats(
             avg_time_to_arrest_minutes=stats['avg_time_to_arrest_minutes'],
         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get statistics: {str(e)}")
+    except Exception as exc:
+        _raise_internal_server_error("Honeypot statistics retrieval", exc)
 
 
 @app.post(
@@ -1997,7 +2126,8 @@ async def get_honeypot_stats(
     response_model=BlockchainEvidenceResponse,
     tags=["Innovation - Blockchain Evidence"],
     summary="Seal evidence in blockchain",
-    description="Innovation 6: Create immutable evidence record for legal admissibility"
+    description="Innovation 6: Create immutable evidence record for legal admissibility",
+    dependencies=[Depends(require_api_key)]
 )
 async def seal_evidence(request: BlockchainSealRequest):
     """
@@ -2006,7 +2136,8 @@ async def seal_evidence(request: BlockchainSealRequest):
     Creates cryptographically-signed, immutable evidence record across
     18 validator nodes for legal proceedings
     """
-    if not INNOVATIONS_AVAILABLE or state.blockchain_manager is None:
+    blockchain_manager = state.services.optional_get("blockchain_manager")
+    if not INNOVATIONS_AVAILABLE or blockchain_manager is None:
         raise HTTPException(status_code=503, detail="Blockchain system not available")
     
     try:
@@ -2014,7 +2145,7 @@ async def seal_evidence(request: BlockchainSealRequest):
         result = await loop.run_in_executor(
             None,
             partial(
-                state.blockchain_manager.seal_evidence,
+                blockchain_manager.seal_evidence,
                 transaction_id=request.transaction_id,
                 source_account=request.source_account,
                 target_account=request.target_account,
@@ -2034,8 +2165,8 @@ async def seal_evidence(request: BlockchainSealRequest):
             validators=result.validator_signatures,
         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Evidence sealing failed: {str(e)}")
+    except Exception as exc:
+        _raise_internal_server_error("Evidence sealing", exc)
 
 
 @app.get(
@@ -2043,7 +2174,8 @@ async def seal_evidence(request: BlockchainSealRequest):
     response_model=BlockchainVerificationResponse,
     tags=["Innovation - Blockchain Evidence"],
     summary="Verify blockchain evidence",
-    description="Innovation 6: Verify integrity and authenticity of sealed evidence"
+    description="Innovation 6: Verify integrity and authenticity of sealed evidence",
+    dependencies=[Depends(require_api_key)]
 )
 async def verify_evidence(evidence_id: str, block_number: int):
     """
@@ -2052,14 +2184,15 @@ async def verify_evidence(evidence_id: str, block_number: int):
     Checks evidence across multiple validator nodes within given block
     to ensure chain integrity and authenticity
     """
-    if not INNOVATIONS_AVAILABLE or state.blockchain_manager is None:
+    blockchain_manager = state.services.optional_get("blockchain_manager")
+    if not INNOVATIONS_AVAILABLE or blockchain_manager is None:
         raise HTTPException(status_code=503, detail="Blockchain system not available")
     
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            partial(state.blockchain_manager.verify_evidence, evidence_id, block_number),
+            partial(blockchain_manager.verify_evidence, evidence_id, block_number),
         )
         
         return BlockchainVerificationResponse(
@@ -2072,8 +2205,8 @@ async def verify_evidence(evidence_id: str, block_number: int):
             verification_details=result.get('details', {}),
         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
+    except Exception as exc:
+        _raise_internal_server_error("Evidence verification", exc)
 
 
 @app.post(
@@ -2097,7 +2230,8 @@ async def export_legal_evidence(
     Generates complete evidence package with chain of custody,
     validator attestations, and court-formatted documentation
     """
-    if not INNOVATIONS_AVAILABLE or state.blockchain_manager is None:
+    blockchain_manager = state.services.optional_get("blockchain_manager")
+    if not INNOVATIONS_AVAILABLE or blockchain_manager is None:
         raise HTTPException(status_code=503, detail="Blockchain system not available")
     
     try:
@@ -2131,8 +2265,8 @@ async def export_legal_evidence(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Evidence export failed: {str(e)}")
+    except Exception as exc:
+        _raise_internal_server_error("Evidence export", exc)
 
 
 def main():
