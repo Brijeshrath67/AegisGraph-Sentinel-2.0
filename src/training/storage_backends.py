@@ -93,3 +93,4 @@ class S3Backend(StorageBackend):
             return True
         except ClientError:
             return False
+# placeholder fix for PR
